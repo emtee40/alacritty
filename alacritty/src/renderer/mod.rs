@@ -16,6 +16,7 @@ use alacritty_terminal::term::color::Rgb;
 use crate::display::content::RenderableCell;
 use crate::display::SizeInfo;
 use crate::gl;
+use crate::gl::types::GLint;
 use crate::renderer::rects::{RectRenderer, RenderRect};
 use crate::renderer::shader::ShaderError;
 
@@ -105,6 +106,9 @@ impl Renderer {
         };
 
         info!("Running on {}", renderer);
+
+        // Log the GPU reset status.
+        Self::log_reset_notification_status();
 
         let (text_renderer, rect_renderer) = if version.as_ref() >= "3.3" {
             let text_renderer = TextRendererProvider::Glsl3(Glsl3Renderer::new()?);
@@ -205,6 +209,45 @@ impl Renderer {
                 alpha,
             );
             gl::Clear(gl::COLOR_BUFFER_BIT);
+        }
+    }
+
+    /// Get the context reset status.
+    pub fn was_context_reset(&self) -> bool {
+        let status = unsafe { gl::GetGraphicsResetStatus() };
+        if status == gl::NO_ERROR {
+            false
+        } else {
+            let reason = match status {
+                gl::GUILTY_CONTEXT_RESET_KHR => "guilty",
+                gl::INNOCENT_CONTEXT_RESET_KHR => "innocent",
+                gl::UNKNOWN_CONTEXT_RESET_KHR => "unknown",
+                _ => "invalid",
+            };
+
+            info!("GPU reset ({})", reason);
+
+            true
+        }
+    }
+
+    /// Log reset notifications.
+    fn log_reset_notification_status() -> bool {
+        let mut notification_strategy = 0;
+        if !GlExtensions::contains("GL_KHR_robustness") {
+            notification_strategy = gl::NO_RESET_NOTIFICATION_KHR as GLint;
+        } else {
+            unsafe {
+                gl::GetIntegerv(gl::RESET_NOTIFICATION_STRATEGY_KHR, &mut notification_strategy);
+            }
+        }
+
+        if notification_strategy == gl::LOSE_CONTEXT_ON_RESET_KHR as GLint {
+            info!("GPU reset notifications are enabled");
+            true
+        } else {
+            info!("GPU reset notifications are disabled");
+            false
         }
     }
 

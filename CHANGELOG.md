@@ -19,6 +19,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 - Crash with `OT-SVG` fonts on Linux/BSD
 - Crash during text compose on old GNOME under Wayland
 - Mouse cursor staying hidden after window regains focus on macOS Ventura
+- OpenGL context reset not being handled
 
 ## 0.11.0
 

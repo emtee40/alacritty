@@ -9,7 +9,10 @@ use std::ops::{Deref, DerefMut};
 #[cfg(all(feature = "wayland", not(any(target_os = "macos", windows))))]
 use std::sync::atomic::Ordering;
 
+use glutin::config::GetGlConfig;
 use glutin::context::{NotCurrentContext, PossiblyCurrentContext};
+use glutin::display::GetGlDisplay;
+use glutin::error::ErrorKind;
 use glutin::prelude::*;
 use glutin::surface::{Rect as DamageRect, Surface, SwapInterval, WindowSurface};
 
@@ -537,9 +540,52 @@ impl Display {
         }
     }
 
-    pub fn make_current(&self) {
-        if !self.context.get().is_current() {
-            self.context.make_current(&self.surface).expect("failed to make context current")
+    pub fn make_current(&mut self, handle_lost: bool) {
+        let is_current = self.context.get().is_current();
+        if is_current && !handle_lost {
+            return;
+        }
+
+        let mut was_context_reset = if is_current {
+            false
+        } else {
+            match self.context.make_current(&self.surface) {
+                Err(err) if err.error_kind() == ErrorKind::ContextLost => true,
+                _ => false,
+            }
+        };
+
+        if !was_context_reset {
+            was_context_reset |= self.renderer.was_context_reset();
+        }
+
+        if was_context_reset && handle_lost {
+            let gl_display = self.context.display();
+            let gl_config = self.context.config();
+            let raw_window_handle = Some(self.window.raw_window_handle());
+            let context =
+                renderer::platform::create_gl_context(&gl_display, &gl_config, raw_window_handle)
+                    .expect("failed to recreate context.");
+
+            // Drop the old context and renderer.
+            unsafe {
+                ManuallyDrop::drop(&mut self.renderer);
+                ManuallyDrop::drop(&mut self.context);
+            }
+
+            // Activate new context.
+            let context = context.treat_as_possibly_current();
+            self.context = ManuallyDrop::new(Replaceable::new(context));
+            self.context
+                .make_current(&self.surface)
+                .expect("failed to reativate context after reset.");
+
+            let renderer =
+                Renderer::new(&self.context).expect("failed to recreate renderer after reset");
+            self.renderer = ManuallyDrop::new(renderer);
+
+            // Resize the renderer.
+            self.renderer.resize(&self.size_info);
         }
     }
 
@@ -672,7 +718,7 @@ impl Display {
         }
 
         // Ensure we're modifying the correct OpenGL context.
-        self.make_current();
+        self.make_current(true);
 
         if renderer_update.clear_font_cache {
             self.reset_glyph_cache();
@@ -778,7 +824,7 @@ impl Display {
         drop(terminal);
 
         // Make sure this window's OpenGL context is active.
-        self.make_current();
+        self.make_current(true);
 
         self.renderer.clear(background_color, config.window_opacity());
         let mut lines = RenderLines::new();
@@ -1390,7 +1436,7 @@ impl Drop for Display {
     fn drop(&mut self) {
         // Switch OpenGL context before dropping, otherwise objects (like programs) from other
         // contexts might be deleted during droping renderer.
-        self.make_current();
+        self.make_current(false);
         unsafe {
             ManuallyDrop::drop(&mut self.renderer);
             ManuallyDrop::drop(&mut self.context);
