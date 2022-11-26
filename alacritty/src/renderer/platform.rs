@@ -4,9 +4,9 @@ use std::num::NonZeroU32;
 
 use glutin::config::{ColorBufferType, Config, ConfigTemplateBuilder, GetGlConfig};
 use glutin::context::{
-    ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, Version,
+    ContextApi, ContextAttributesBuilder, GlProfile, NotCurrentContext, Robustness, Version,
 };
-use glutin::display::{Display, DisplayApiPreference, GetGlDisplay};
+use glutin::display::{Display, DisplayApiPreference, DisplayFeatures, GetGlDisplay};
 use glutin::error::Result as GlutinResult;
 use glutin::prelude::*;
 use glutin::surface::{Surface, SurfaceAttributesBuilder, WindowSurface};
@@ -78,9 +78,17 @@ pub fn create_gl_context(
     gl_config: &Config,
     raw_window_handle: Option<RawWindowHandle>,
 ) -> GlutinResult<NotCurrentContext> {
-    let context_attributes = ContextAttributesBuilder::new()
-        .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))))
-        .build(raw_window_handle);
+    let mut context_attributes = ContextAttributesBuilder::new()
+        .with_context_api(ContextApi::OpenGl(Some(Version::new(3, 3))));
+
+    // Try to enable robustness.
+    if gl_display.supported_features().contains(DisplayFeatures::CONTEXT_ROBUSTNESS) {
+        context_attributes =
+            context_attributes.with_robustness(Robustness::RobustLoseContextOnReset);
+    }
+
+    // Build the attributes.
+    let context_attributes = context_attributes.build(raw_window_handle);
 
     unsafe {
         if let Ok(gl_context) = gl_display.create_context(gl_config, &context_attributes) {
