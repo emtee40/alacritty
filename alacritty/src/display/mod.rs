@@ -34,6 +34,7 @@ use alacritty_terminal::term::color::Rgb;
 use alacritty_terminal::term::{self, Term, TermDamage, TermMode, MIN_COLUMNS, MIN_SCREEN_LINES};
 
 use crate::config::font::Font;
+use crate::config::ui_config::{Scrollbar as ScrollbarConfig, ScrollbarMode};
 use crate::config::window::Dimensions;
 #[cfg(not(windows))]
 use crate::config::window::StartupMode;
@@ -45,6 +46,7 @@ use crate::display::cursor::IntoRects;
 use crate::display::damage::RenderDamageIterator;
 use crate::display::hint::{HintMatch, HintState};
 use crate::display::meter::Meter;
+use crate::display::scrollbar::Scrollbar;
 use crate::display::window::Window;
 use crate::event::{Event, EventType, Mouse, SearchState};
 use crate::message_bar::{MessageBuffer, MessageType};
@@ -62,6 +64,7 @@ mod bell;
 mod color;
 mod damage;
 mod meter;
+mod scrollbar;
 
 /// Label for the forward terminal search bar.
 const FORWARD_SEARCH_LABEL: &str = "Search: ";
@@ -152,7 +155,10 @@ pub struct SizeInfo<T = f32> {
     cell_height: T,
 
     /// Horizontal window padding.
-    padding_x: T,
+    padding_left: T,
+
+    /// Horizontal window padding.
+    padding_right: T,
 
     /// Vertical window padding.
     padding_y: T,
@@ -171,7 +177,8 @@ impl From<SizeInfo<f32>> for SizeInfo<u32> {
             height: size_info.height as u32,
             cell_width: size_info.cell_width as u32,
             cell_height: size_info.cell_height as u32,
-            padding_x: size_info.padding_x as u32,
+            padding_left: size_info.padding_left as u32,
+            padding_right: size_info.padding_right as u32,
             padding_y: size_info.padding_y as u32,
             screen_lines: size_info.screen_lines,
             columns: size_info.screen_lines,
@@ -212,8 +219,13 @@ impl<T: Clone + Copy> SizeInfo<T> {
     }
 
     #[inline]
-    pub fn padding_x(&self) -> T {
-        self.padding_x
+    pub fn padding_left(&self) -> T {
+        self.padding_left
+    }
+
+    #[inline]
+    pub fn padding_right(&self) -> T {
+        self.padding_right
     }
 
     #[inline]
@@ -231,17 +243,22 @@ impl SizeInfo<f32> {
         cell_height: f32,
         mut padding_x: f32,
         mut padding_y: f32,
+        scrollbar_width: f32,
         dynamic_padding: bool,
     ) -> SizeInfo {
         if dynamic_padding {
-            padding_x = Self::dynamic_padding(padding_x.floor(), width, cell_width);
-            padding_y = Self::dynamic_padding(padding_y.floor(), height, cell_height);
+            padding_x = Self::dynamic_padding(
+                padding_x.floor().mul_add(2., scrollbar_width),
+                width,
+                cell_width,
+            );
+            padding_y = Self::dynamic_padding(padding_y.floor() * 2., height, cell_height);
         }
 
         let lines = (height - 2. * padding_y) / cell_height;
         let screen_lines = cmp::max(lines as usize, MIN_SCREEN_LINES);
 
-        let columns = (width - 2. * padding_x) / cell_width;
+        let columns = (width - 2. * padding_x - scrollbar_width) / cell_width;
         let columns = cmp::max(columns as usize, MIN_COLUMNS);
 
         SizeInfo {
@@ -249,7 +266,8 @@ impl SizeInfo<f32> {
             height,
             cell_width,
             cell_height,
-            padding_x: padding_x.floor(),
+            padding_left: padding_x.floor(),
+            padding_right: padding_x.floor() + scrollbar_width.floor(),
             padding_y: padding_y.floor(),
             screen_lines,
             columns,
@@ -266,8 +284,8 @@ impl SizeInfo<f32> {
     /// The padding, message bar or search are not counted as part of the grid.
     #[inline]
     pub fn contains_point(&self, x: usize, y: usize) -> bool {
-        x <= (self.padding_x + self.columns as f32 * self.cell_width) as usize
-            && x > self.padding_x as usize
+        x <= (self.padding_left + self.columns as f32 * self.cell_width) as usize
+            && x > self.padding_left as usize
             && y <= (self.padding_y + self.screen_lines as f32 * self.cell_height) as usize
             && y > self.padding_y as usize
     }
@@ -275,7 +293,7 @@ impl SizeInfo<f32> {
     /// Calculate padding to spread it evenly around the terminal content.
     #[inline]
     fn dynamic_padding(padding: f32, dimension: f32, cell_dimension: f32) -> f32 {
-        padding + ((dimension - 2. * padding) % cell_dimension) / 2.
+        padding + ((dimension - padding) % cell_dimension) / 2.
     }
 }
 
@@ -352,6 +370,8 @@ pub struct Display {
     pub cursor_hidden: bool,
 
     pub visual_bell: VisualBell,
+
+    pub scrollbar: Scrollbar,
 
     /// Mapped RGB values for each terminal color.
     pub colors: List,
@@ -441,11 +461,12 @@ impl Display {
             cell_height,
             padding.0,
             padding.1,
+            config.scrollbar.additional_padding(cell_width, padding.0),
             config.window.dynamic_padding && config.window.dimensions().is_none(),
         );
 
         info!("Cell size: {} x {}", cell_width, cell_height);
-        info!("Padding: {} x {}", size_info.padding_x(), size_info.padding_y());
+        info!("Padding: {} x {}", size_info.padding_left(), size_info.padding_y());
         info!("Width: {}, Height: {}", size_info.width(), size_info.height());
 
         // Update OpenGL projection.
@@ -516,6 +537,7 @@ impl Display {
             cursor_hidden: false,
             frame_timer: FrameTimer::new(),
             visual_bell: VisualBell::from(&config.bell),
+            scrollbar: Scrollbar::from(&config.scrollbar),
             colors: List::from(&config.colors),
             pending_update: Default::default(),
             pending_renderer_update: Default::default(),
@@ -639,6 +661,7 @@ impl Display {
             cell_height,
             padding.0,
             padding.1,
+            config.scrollbar.additional_padding(cell_width, padding.0),
             config.window.dynamic_padding,
         );
 
@@ -707,7 +730,7 @@ impl Display {
             }
         }
 
-        info!("Padding: {} x {}", self.size_info.padding_x(), self.size_info.padding_y());
+        info!("Padding: {} x {}", self.size_info.padding_left(), self.size_info.padding_y());
         info!("Width: {}, Height: {}", self.size_info.width(), self.size_info.height());
 
         // Damage the entire screen after processing update.
@@ -927,6 +950,16 @@ impl Display {
             }
         }
 
+        if config.scrollbar.mode != ScrollbarMode::Never {
+            self.draw_scrollbar(
+                &mut rects,
+                scheduler,
+                display_offset,
+                total_lines,
+                &config.scrollbar,
+            );
+        }
+
         if self.debug_damage {
             self.highlight_damage(&mut rects);
         }
@@ -1009,6 +1042,7 @@ impl Display {
     pub fn update_config(&mut self, config: &UiConfig) {
         self.debug_damage = config.debug.highlight_damage;
         self.visual_bell.update_config(&config.bell);
+        self.scrollbar.update_config(&config.scrollbar);
         self.colors = List::from(&config.colors);
     }
 
@@ -1064,6 +1098,53 @@ impl Display {
         self.highlighted_hint = highlighted_hint;
 
         dirty
+    }
+
+    fn draw_scrollbar(
+        &mut self,
+        rects: &mut Vec<RenderRect>,
+        scheduler: &mut Scheduler,
+        display_offset: usize,
+        total_lines: usize,
+        config: &ScrollbarConfig,
+    ) {
+        let did_position_change = self.scrollbar.update(display_offset, total_lines);
+        let opacity = match self.scrollbar.intensity(self.size_info) {
+            scrollbar::ScrollbarState::Show { opacity } => opacity,
+            scrollbar::ScrollbarState::WaitForFading { opacity, remaining_duration } => {
+                self.request_scrollbar_redraw(scheduler, remaining_duration);
+                opacity
+            },
+            scrollbar::ScrollbarState::Fading { opacity } => {
+                self.window.request_redraw();
+                opacity
+            },
+            scrollbar::ScrollbarState::Invisible { has_damage } => {
+                if !has_damage {
+                    return;
+                }
+                0.
+            },
+        };
+        let bg_rect = self.scrollbar.bg_rect(self.size_info);
+        let scrollbar_rect = self.scrollbar.rect_from_bg_rect(bg_rect, self.size_info);
+        let y = self.size_info.height - (scrollbar_rect.y + scrollbar_rect.height) as f32;
+        if opacity != 0. {
+            rects.push(RenderRect::new(
+                scrollbar_rect.x as f32,
+                y,
+                scrollbar_rect.width as f32,
+                scrollbar_rect.height as f32,
+                config.color,
+                opacity,
+            ));
+        }
+
+        if did_position_change {
+            self.damage_rects.push(bg_rect);
+        } else if config.mode == ScrollbarMode::Fading && opacity < config.opacity.as_f32() {
+            self.damage_rects.push(scrollbar_rect);
+        }
     }
 
     #[inline(never)]
@@ -1341,7 +1422,7 @@ impl Display {
     /// This method also enqueues damage for the next frame automatically.
     fn damage_from_point(&self, point: Point<usize>, len: u32) -> DamageRect {
         let size_info: SizeInfo<u32> = self.size_info.into();
-        let x = size_info.padding_x() + point.column.0 as u32 * size_info.cell_width();
+        let x = size_info.padding_left() + point.column.0 as u32 * size_info.cell_width();
         let y_top = size_info.height() - size_info.padding_y();
         let y = y_top - (point.line as u32 + 1) * size_info.cell_height();
         let width = len * size_info.cell_width();
@@ -1407,9 +1488,18 @@ impl Display {
 
         let window_id = self.window.id();
         let timer_id = TimerId::new(Topic::Frame, window_id);
-        let event = Event::new(EventType::Frame, window_id);
+        let event = Event::new(EventType::Frame { force: false }, window_id);
 
         scheduler.schedule(event, swap_timeout, false, timer_id);
+    }
+
+    fn request_scrollbar_redraw(&mut self, scheduler: &mut Scheduler, wait_timeout: Duration) {
+        let window_id = self.window.id();
+        let timer_id = TimerId::new(Topic::ScrollbarRedraw, window_id);
+        let event = Event::new(EventType::Frame { force: true }, window_id);
+
+        scheduler.unschedule(timer_id);
+        scheduler.schedule(event, wait_timeout, false, timer_id);
     }
 }
 
@@ -1625,7 +1715,8 @@ fn window_size(
     let grid_width = cell_width * dimensions.columns.0.max(MIN_COLUMNS) as f32;
     let grid_height = cell_height * dimensions.lines.max(MIN_SCREEN_LINES) as f32;
 
-    let width = (padding.0).mul_add(2., grid_width).floor();
+    let width = (padding.0).mul_add(2., grid_width).floor()
+        + config.scrollbar.additional_padding(cell_width, padding.0);
     let height = (padding.1).mul_add(2., grid_height).floor();
 
     PhysicalSize::new(width as u32, height as u32)

@@ -100,7 +100,9 @@ pub enum EventType {
     BlinkCursor,
     BlinkCursorTimeout,
     SearchNext,
-    Frame,
+    Frame {
+        force: bool,
+    },
 }
 
 impl From<TerminalEvent> for EventType {
@@ -302,11 +304,22 @@ impl<'a, N: Notify + 'a, T: EventListener> input::ActionContext<T> for ActionCon
         *self.dirty |= selection.map_or(false, |s| !s.is_empty());
     }
 
+    fn stop_selection(&mut self) {
+        if let Some(selection) = self.terminal.selection.as_mut() {
+            selection.active = false;
+        };
+    }
+
     fn update_selection(&mut self, mut point: Point, side: Side) {
         let mut selection = match self.terminal.selection.take() {
             Some(selection) => selection,
             None => return,
         };
+
+        if !selection.active {
+            self.terminal.selection = Some(selection);
+            return;
+        }
 
         // Treat motion over message bar like motion over the last line.
         point.line = min(point.line, self.terminal.bottommost_line());
@@ -1127,6 +1140,7 @@ pub enum TouchPurpose {
     None,
     Select(TouchEvent),
     Scroll(TouchEvent),
+    ScrollbarDrag(TouchEvent),
     Zoom(TouchZoom),
     Tap(TouchEvent),
     Invalid(HashSet<u64, RandomState>),
@@ -1232,7 +1246,8 @@ impl Mouse {
     /// coordinates will be clamped to the closest grid coordinates.
     #[inline]
     pub fn point(&self, size: &SizeInfo, display_offset: usize) -> Point {
-        let col = self.x.saturating_sub(size.padding_x() as usize) / (size.cell_width() as usize);
+        let col =
+            self.x.saturating_sub(size.padding_left() as usize) / (size.cell_width() as usize);
         let col = min(Column(col), size.last_column());
 
         let line = self.y.saturating_sub(size.padding_y() as usize) / (size.cell_height() as usize);
@@ -1341,7 +1356,7 @@ impl input::Processor<EventProxy, ActionContext<'_, Notifier, EventProxy>> {
                 EventType::Message(_)
                 | EventType::ConfigReload(_)
                 | EventType::CreateWindow(_)
-                | EventType::Frame => (),
+                | EventType::Frame { .. } => (),
             },
             WinitEvent::WindowEvent { event, .. } => {
                 match event {
@@ -1629,11 +1644,11 @@ impl Processor {
                 // NOTE: This event bypasses batching to minimize input latency.
                 WinitEvent::UserEvent(Event {
                     window_id: Some(window_id),
-                    payload: EventType::Frame,
+                    payload: EventType::Frame { force },
                 }) => {
                     if let Some(window_context) = self.windows.get_mut(&window_id) {
                         window_context.display.window.has_frame = true;
-                        if window_context.dirty {
+                        if window_context.dirty || force {
                             window_context.display.window.request_redraw();
                         }
                     }
